@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 import secrets
 import string
+import io
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
@@ -559,7 +560,8 @@ async def _send_backup_to_channel(channel_id: int) -> Optional[types.Message]:
         # Trim older backups
         try:
             docs = []
-            async for msg in bot.iter_history(channel_id, limit=200):
+            # aiogram v3: use get_chat_history
+            async for msg in bot.get_chat_history(chat_id=channel_id, limit=200):
                 if getattr(msg, "document", None):
                     fn = getattr(msg.document, "file_name", "") or ""
                     if os.path.basename(DB_PATH) in fn or fn.lower().endswith(".sqlite") or fn.lower().endswith(".sqlite3"):
@@ -611,6 +613,7 @@ async def _download_doc_to_tempfile(file_id: str) -> Optional[str]:
         file_bytes = None
         if file_path:
             try:
+                # bot.download_file may return a BytesIO or bytes depending on aiogram
                 file_bytes = await bot.download_file(file_path)
             except Exception:
                 try:
@@ -628,7 +631,25 @@ async def _download_doc_to_tempfile(file_id: str) -> Optional[str]:
         else:
             try:
                 fd = await bot.download_file_by_id(file_id)
-                file_bytes = fd.read()
+                # fd might be a BytesIO-like or object with read()
+                try:
+                    # If fd has read() coroutine or method, call it safely
+                    if hasattr(fd, "read"):
+                        # fd.read() might be sync
+                        read_result = fd.read()
+                        # if it's awaitable, await it
+                        if asyncio.iscoroutine(read_result):
+                            file_bytes = await read_result
+                        else:
+                            file_bytes = read_result
+                    else:
+                        file_bytes = fd
+                except Exception:
+                    # fallback: try to coerce to bytes
+                    try:
+                        file_bytes = bytes(fd)
+                    except Exception:
+                        file_bytes = None
             except Exception:
                 logger.exception("Failed direct download by id")
                 return None
@@ -636,11 +657,40 @@ async def _download_doc_to_tempfile(file_id: str) -> Optional[str]:
         if not file_bytes:
             return None
 
+        # Normalize to raw bytes
+        data = None
+        try:
+            if isinstance(file_bytes, (bytes, bytearray)):
+                data = bytes(file_bytes)
+            elif hasattr(file_bytes, "getvalue"):
+                # io.BytesIO or similar
+                data = file_bytes.getvalue()
+            elif hasattr(file_bytes, "read"):
+                # file-like object (sync)
+                file_bytes.seek(0)
+                data = file_bytes.read()
+                if isinstance(data, memoryview):
+                    data = bytes(data)
+            else:
+                # last resort try to convert
+                data = bytes(file_bytes)
+        except Exception:
+            try:
+                # fallback: try awaiting .read() (for async streams)
+                if hasattr(file_bytes, "read") and asyncio.iscoroutinefunction(getattr(file_bytes, "read")):
+                    data = await file_bytes.read()
+            except Exception:
+                data = None
+
+        if data is None:
+            logger.error("Could not obtain raw bytes for file_id %s", file_id)
+            return None
+
         tmp = tempfile.NamedTemporaryFile(delete=False)
         tmpname = tmp.name
         tmp.close()
         with open(tmpname, "wb") as out:
-            out.write(file_bytes)
+            out.write(data)
         return tmpname
     except Exception:
         logger.exception("Failed to download document to tempfile")
@@ -711,7 +761,8 @@ async def restore_db_from_pinned(force: bool = False) -> bool:
                 continue
             try:
                 logger.info("Scanning recent messages in channel %s for backups", ch)
-                async for msg in bot.iter_history(ch, limit=200):
+                # aiogram v3: use get_chat_history
+                async for msg in bot.get_chat_history(chat_id=ch, limit=200):
                     if getattr(msg, "document", None):
                         fn = getattr(msg.document, "file_name", "") or ""
                         if os.path.basename(DB_PATH) in fn or fn.lower().endswith(".sqlite") or fn.lower().endswith(".sqlite3"):
@@ -1224,7 +1275,14 @@ async def _finalize_pending(m: types.Message):
     choice = m.text.strip().lower()
     responses = []
 
-    if key in pending_setimage:
+    # Only act if there is pending data
+    has_image = key in pending_setimage
+    has_message = key in pending_setmessage
+    if not (has_image or has_message):
+        # no pending state; ignore to avoid interfering with normal flows
+        return
+
+    if has_image:
         data_img = pending_setimage.pop(key, None)
         if data_img and data_img.get("file_id"):
             try:
@@ -1236,7 +1294,7 @@ async def _finalize_pending(m: types.Message):
         else:
             responses.append(f"No pending image to set for {choice}.")
 
-    if key in pending_setmessage:
+    if has_message:
         data_txt = pending_setmessage.pop(key, None)
         if data_txt and data_txt.get("text"):
             try:
@@ -1650,25 +1708,7 @@ async def on_startup(dispatcher):
     if db_get("help_text") is None:
         db_set("help_text", "This bot delivers sessions.")
 
-    try:
-        default_commands = [
-            BotCommand("start", "Start / open deep link"),
-            BotCommand("help", "Show help"),
-        ]
-        await bot.set_my_commands(default_commands)
-        try:
-            admin_commands = [
-                BotCommand("start", "Start / open deep link"),
-                BotCommand("help", "Show help"),
-                BotCommand("adminp", "Owner panel"),
-                BotCommand("stats", "Stats (owner)")
-            ]
-            await bot.set_my_commands(admin_commands, scope=types.BotCommandScopeChat(OWNER_ID))
-        except Exception:
-            logger.exception("Failed setting admin-scoped commands")
-    except Exception:
-        logger.exception("Couldn't set bot commands")
-
+    # NOTE: intentionally not setting bot commands here to avoid populating BotFather keypad
     logger.info("on_startup complete")
 
 async def on_shutdown(dispatcher):
