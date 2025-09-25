@@ -769,7 +769,6 @@ async def restore_pending_jobs_and_schedule():
                 logger.info("Scheduled delete job %s at %s", job_id, run_at.isoformat())
         except Exception:
             logger.exception("Failed to restore job %s", job.get("id"))
-
 # -------------------------
 # Health endpoint (aiohttp)
 # -------------------------
