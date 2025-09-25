@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-# bot.py - Vault-style Telegram bot with robust multi-channel backups, integrity checks,
-# rolling history, debounced backups, periodic backups, Neon mirror, admin-scoped commands.
+# bot.py
+# Vault-style Telegram bot with robust persistence:
+# - SQLite primary DB (local)
+# - Rolling backups to DB_CHANNEL_ID and DB_CHANNEL_ID2 (Telegram channels)
+# - Neon mirror (Postgres) if NEON_URL set (asyncpg)
+# - APScheduler persistent jobstore (JOB_DB_PATH)
+# - Debounced backups + periodic safety backups
+# - Upload sessions, deep links, auto-delete scheduling
+# - Admin-scoped commands (owner sees admin panel)
+# - aiohttp healthcheck server (for web deployments)
 
 import os
 import logging
@@ -18,7 +26,6 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
 from aiogram.dispatcher.handler import CancelHandler
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils.callback_data import CallbackData
-from aiogram.utils import executor
 
 from aiogram.utils.exceptions import (
     BotBlocked,
@@ -53,7 +60,7 @@ DB_CHANNEL_ID = int(os.environ.get("DB_CHANNEL_ID") or 0)
 DB_CHANNEL_ID2 = int(os.environ.get("DB_CHANNEL_ID2") or 0)  # optional second DB backup channel
 DB_PATH = os.environ.get("DB_PATH", "/data/database.sqlite3")
 JOB_DB_PATH = os.environ.get("JOB_DB_PATH", "/data/jobs.sqlite")
-PORT = int(os.environ.get("PORT", "10000"))
+PORT = int(os.environ.get("PORT", "8080"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 BROADCAST_CONCURRENCY = int(os.environ.get("BROADCAST_CONCURRENCY", "12"))
 AUTO_BACKUP_HOURS = int(os.environ.get("AUTO_BACKUP_HOURS", "6"))  # periodic safety backup
@@ -224,7 +231,6 @@ async def init_neon_pool():
         return
     try:
         neon_pool = await asyncpg.create_pool(dsn=NEON_URL, min_size=1, max_size=3)
-        # ensure table exists
         async with neon_pool.acquire() as conn:
             await conn.execute(
                 """
@@ -780,20 +786,34 @@ async def restore_pending_jobs_and_schedule():
 # -------------------------
 # Health endpoint (aiohttp)
 # -------------------------
-async def handle_health(request):
-    return web.Response(text="ok")
+WEB_RUNNER: Optional[web.AppRunner] = None
 
-async def run_health_app():
+async def healthcheck(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    global WEB_RUNNER
     try:
         app = web.Application()
-        app.add_routes([web.get('/', handle_health), web.get('/health', handle_health)])
+        app.router.add_get("/", healthcheck)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', PORT)
         await site.start()
-        logger.info("Health endpoint running on 0.0.0.0:%s/health", PORT)
+        WEB_RUNNER = runner
+        logger.info("Health endpoint running on 0.0.0.0:%s/", PORT)
     except Exception:
         logger.exception("Failed to start health server")
+
+async def stop_web_server():
+    global WEB_RUNNER
+    try:
+        if WEB_RUNNER:
+            await WEB_RUNNER.cleanup()
+            WEB_RUNNER = None
+            logger.info("Health endpoint stopped")
+    except Exception:
+        logger.exception("Failed to stop health server")
 
 # -------------------------
 # Utilities for buttons and owner check
@@ -818,7 +838,7 @@ def generate_token(length: int = 8) -> str:
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 # -------------------------
-# Command handlers (start + others) - unchanged logic but preserved
+# Command handlers (start + others)
 # -------------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
@@ -924,13 +944,12 @@ async def cmd_start(message: types.Message):
                     delivered_msg_ids.append(m.message_id)
                 else:
                     try:
-                        # copy from upload channel to user chat; owner bypasses protect
                         m = await bot.copy_message(message.chat.id, UPLOAD_CHANNEL_ID, f["vault_msg_id"],
                                                    caption=f.get("caption") or "",
                                                    protect_content=bool(protect_flag) and not owner_is_requester)
                         delivered_msg_ids.append(m.message_id)
                     except Exception:
-                        # fallback: send by file_id type
+                        # fallback by file_id
                         if f["file_type"] == "photo":
                             sent = await bot.send_photo(message.chat.id, f["file_id"], caption=f.get("caption") or "")
                             delivered_msg_ids.append(sent.message_id)
@@ -1126,7 +1145,6 @@ async def _receive_minutes(m: types.Message):
 
 # -------------------------
 # Settings handlers (setmessage, setimage, setchannel)
-# (kept behavior same as earlier)
 # -------------------------
 @dp.message_handler(commands=["setmessage"])
 async def cmd_setmessage(message: types.Message):
@@ -1601,7 +1619,7 @@ async def on_startup(dispatcher):
     except Exception:
         logger.exception("init_neon_pool failed on startup")
 
-    # Force restore from pinned DB (overwrite local). This guarantees latest state from DB channel.
+    # Attempt restore from channel backups if local DB missing or corrupted
     try:
         await restore_db_from_pinned(force=True)
     except Exception:
@@ -1632,9 +1650,9 @@ async def on_startup(dispatcher):
     except Exception:
         logger.exception("Failed scheduling backup jobs")
 
-    # start health endpoint (background)
+    # start health endpoint (aiohttp) - we run it separately in main(), but keep this as safety if needed
     try:
-        asyncio.create_task(run_health_app())
+        asyncio.create_task(start_web_server())
     except Exception:
         logger.exception("Failed to start health app task")
 
@@ -1718,14 +1736,31 @@ async def on_shutdown(dispatcher):
         await close_neon_pool()
     except Exception:
         logger.exception("Failed closing Neon pool")
+    # stop web server
+    try:
+        await stop_web_server()
+    except Exception:
+        logger.exception("Failed stopping web server")
     await bot.close()
 
 # -------------------------
-# Run (polling)
+# Run (async main combining aiogram polling + aiohttp)
 # -------------------------
+async def main_async():
+    # start web server first
+    await start_web_server()
+
+    # start polling (this will block until shutdown)
+    try:
+        await dp.start_polling(on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
+    except asyncio.CancelledError:
+        logger.info("Polling cancelled")
+    except Exception:
+        logger.exception("Fatal error in polling")
+
 if __name__ == "__main__":
     try:
-        executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
+        asyncio.run(main_async())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Stopped by user")
     except Exception:
