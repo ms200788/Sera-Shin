@@ -1,10 +1,12 @@
 services:
   - type: web
     name: vault-bot
-    env: python
+    env: docker       # use your Dockerfile (better for dependencies)
     plan: free
-    buildCommand: ""
-    startCommand: python bot.py
+    disk:
+      name: data
+      mountPath: /app/data
+      sizeGB: 1
     envVars:
       - key: BOT_TOKEN
         sync: false   # set in Render dashboard
@@ -12,17 +14,17 @@ services:
         sync: false
       - key: UPLOAD_CHANNEL_ID
         sync: false
+      - key: UPLOAD_CHANNEL_ID2
+        sync: false
       - key: DB_CHANNEL_ID
         sync: false
+      - key: DB_CHANNEL_ID2
+        sync: false
       - key: DB_PATH
-        value: "/data/database.sqlite3"
+        value: "/app/data/database.sqlite3"
       - key: JOB_DB_PATH
-        value: "/data/jobs.sqlite"
-      - key: PORT
-        value: "10000"
+        value: "/app/data/jobs.sqlite"
       - key: LOG_LEVEL
         value: "INFO"
       - key: BROADCAST_CONCURRENCY
         value: "12"
-      - key: RENDER_EXTERNAL_HOSTNAME
-        sync: true
