@@ -1696,9 +1696,33 @@ async def on_shutdown(dispatcher):
 # -------------------------
 # Run (polling)
 # -------------------------
+from aiogram import executor
+
+WEBHOOK_PATH = f"/{BOT_TOKEN}"
+WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", 10000))
+
+async def on_startup(dp):
+    # set webhook
+    await bot.set_webhook(WEBHOOK_URL)
+    logging.info(f"Webhook set to {WEBHOOK_URL}")
+
+async def on_shutdown(dp):
+    # delete webhook
+    await bot.delete_webhook()
+    logging.info("Webhook deleted")
+
 if __name__ == "__main__":
-    try:
-        executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
+    executor.start_webhook(
+        dispatcher=dp,
+        webhook_path=WEBHOOK_PATH,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        skip_updates=True,
+        host=WEBAPP_HOST,
+        port=WEBAPP_PORT,
+    )
     except (KeyboardInterrupt, SystemExit):
         logger.info("Stopped by user")
     except Exception:
